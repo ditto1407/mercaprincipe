@@ -1,0 +1,15 @@
+# Variables de entorno (CLAVES SECRETAS)
+.env
+.env.local
+.env.production
+
+# Dependencias de Node.js
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
