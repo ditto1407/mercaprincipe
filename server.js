@@ -29,9 +29,6 @@ const PAYPAL_BASE_URL = process.env.PAYPAL_MODE === 'sandbox'
   ? 'https://api-m.sandbox.paypal.com'
   : 'https://api-m.paypal.com';
 
-// PayPal tiene un límite de 10 items por orden
-const PAYPAL_MAX_ITEMS = 10;
-
 // --- FUNCIÓN: Calcular costo de envío basado en el subtotal ---
 function calcularCostoEnvio(subtotal) {
   const envio = (0.078 * subtotal) + 4.89;
@@ -87,9 +84,10 @@ app.post('/api/create-order', async (req, res) => {
       return res.status(400).json({ error: 'Ninguno de los productos seleccionados está disponible.' });
     }
 
-    // 2. Calcular el subtotal usando los precios del servidor
-    let subtotal = 0;
+    // 2. Calcular el subtotal y preparar items para PayPal
+    let subtotalEnCentavos = 0; // Usamos centavos para evitar errores de redondeo
     const verifiedItems = [];
+    const paypalItems = [];
 
     for (const item of items) {
       const product = products.find(p => p.id === item.product_id);
@@ -103,65 +101,49 @@ app.post('/api/create-order', async (req, res) => {
         return res.status(400).json({ error: 'Cantidad inválida' });
       }
 
-      const itemTotal = product.price * item.quantity;
-      subtotal += itemTotal;
+      // Convertir a centavos para evitar errores de punto flotante
+      const priceInCents = Math.round(product.price * 100);
+      const itemTotalInCents = priceInCents * item.quantity;
+      subtotalEnCentavos += itemTotalInCents;
+      
       verifiedItems.push({
         product_id: product.id,
         product_name: product.name,
         quantity: item.quantity,
         price: product.price,
-        subtotal: itemTotal
+        subtotal: itemTotalInCents / 100
+      });
+
+      // Preparar item para PayPal (máximo 127 caracteres en el nombre)
+      paypalItems.push({
+        name: product.name.substring(0, 127),
+        quantity: item.quantity.toString(),
+        unit_amount: { 
+          currency_code: 'USD', 
+          value: (priceInCents / 100).toFixed(2) 
+        }
       });
     }
 
-    console.log("💰 Subtotal calculado:", subtotal.toFixed(2));
+    // Convertir subtotal de centavos a dólares
+    const subtotal = subtotalEnCentavos / 100;
+    console.log("💰 Subtotal calculado:", subtotal.toFixed(2), "(desde centavos:", subtotalEnCentavos, ")");
 
     // 3. CALCULAR ENVÍO DINÁMICO
     const shippingCost = calcularCostoEnvio(subtotal);
     const total = subtotal + shippingCost;
     console.log("🚚 Envío calculado:", shippingCost.toFixed(2), "| Total:", total.toFixed(2));
 
-    // 4. PREPARAR ITEMS PARA PAYPAL (con límite de 10)
-    let paypalItems;
-    let description = 'Pedido MercaPrincipe - Entrega en Cuba';
-    
-    if (verifiedItems.length <= PAYPAL_MAX_ITEMS) {
-      // Si hay 10 o menos productos, enviar todos normalmente
-      paypalItems = verifiedItems.map(item => ({
-        name: item.product_name.substring(0, 127), // PayPal limita a 127 caracteres
-        quantity: item.quantity.toString(),
-        unit_amount: { currency_code: 'USD', value: item.price.toFixed(2) }
-      }));
-    } else {
-      // Si hay MÁS de 10 productos, agruparlos para que PayPal los acepte
-      console.log(`📦 Agrupando ${verifiedItems.length} productos para PayPal (límite: ${PAYPAL_MAX_ITEMS})`);
-      
-      // Tomamos los primeros 9 productos individualmente
-      paypalItems = verifiedItems.slice(0, PAYPAL_MAX_ITEMS - 1).map(item => ({
-        name: item.product_name.substring(0, 127),
-        quantity: item.quantity.toString(),
-        unit_amount: { currency_code: 'USD', value: item.price.toFixed(2) }
-      }));
-      
-      // Agrupamos el resto en un solo item llamado "Productos adicionales"
-      const productosRestantes = verifiedItems.slice(PAYPAL_MAX_ITEMS - 1);
-      const subtotalRestante = productosRestantes.reduce((sum, p) => sum + p.subtotal, 0);
-      const cantidadRestante = productosRestantes.reduce((sum, p) => sum + p.quantity, 0);
-      const precioPromedio = subtotalRestante / cantidadRestante;
-      
-      paypalItems.push({
-        name: `Otros ${productosRestantes.length} productos`,
-        quantity: cantidadRestante.toString(),
-        unit_amount: { currency_code: 'USD', value: precioPromedio.toFixed(2) }
-      });
-      
-      // Creamos una descripción detallada con todos los productos
-      const nombresProductos = verifiedItems.map(p => `${p.quantity}x ${p.product_name}`).join(', ');
-      description = `Pedido MercaPrincipe: ${nombresProductos.substring(0, 1000)}`;
-    }
-
-    // 5. Crear la orden en PayPal
+    // 4. Crear la orden en PayPal
     const token = await getPayPalToken();
+    
+    // Construir la descripción con los nombres de los productos
+    const nombresProductos = verifiedItems.map(p => `${p.quantity}x ${p.product_name}`).join(', ');
+    const description = `Pedido MercaPrincipe: ${nombresProductos.substring(0, 1000)}`;
+    
+    // Calcular item_total desde los centavos para que coincida EXACTAMENTE
+    const itemTotalForPayPal = (subtotalEnCentavos / 100).toFixed(2);
+    
     const paypalPayload = {
       intent: 'CAPTURE',
       purchase_units: [{
@@ -169,20 +151,29 @@ app.post('/api/create-order', async (req, res) => {
           currency_code: 'USD',
           value: total.toFixed(2),
           breakdown: {
-            item_total: { currency_code: 'USD', value: subtotal.toFixed(2) },
-            shipping: { currency_code: 'USD', value: shippingCost.toFixed(2) }
+            item_total: { 
+              currency_code: 'USD', 
+              value: itemTotalForPayPal
+            },
+            shipping: { 
+              currency_code: 'USD', 
+              value: shippingCost.toFixed(2) 
+            }
           }
         },
-        description: description
+        description: description,
+        // Solo enviar items si hay 10 o menos (límite de PayPal)
+        items: paypalItems.length <= 10 ? paypalItems : undefined
       }]
     };
-    
-    // Solo agregar items si hay 10 o menos (para evitar problemas de validación)
-    if (verifiedItems.length <= PAYPAL_MAX_ITEMS) {
-      paypalPayload.purchase_units[0].items = paypalItems;
-    }
 
-    console.log("💳 Enviando petición a PayPal...");
+    console.log("💳 Enviando petición a PayPal con", paypalItems.length, "items");
+    console.log(" Payload breakdown:", {
+      item_total: itemTotalForPayPal,
+      shipping: shippingCost.toFixed(2),
+      total: total.toFixed(2)
+    });
+    
     const paypalResponse = await fetch(`${PAYPAL_BASE_URL}/v2/checkout/orders`, {
       method: 'POST',
       headers: {
@@ -197,12 +188,15 @@ app.post('/api/create-order', async (req, res) => {
     if (!paypalOrder.id) {
       console.error('❌ Error PayPal DETALLADO:', JSON.stringify(paypalOrder, null, 2));
       const errorMsg = paypalOrder.message || paypalOrder.name || 'Error desconocido de PayPal';
-      return res.status(500).json({ error: `Error al crear orden en PayPal: ${errorMsg}` });
+      return res.status(500).json({ 
+        error: `Error al crear orden en PayPal: ${errorMsg}`,
+        details: paypalOrder 
+      });
     }
 
     console.log("🎉 Orden de PayPal creada con éxito:", paypalOrder.id);
 
-    // 6. Devolver al frontend
+    // 5. Devolver al frontend
     res.json({
       paypalOrderId: paypalOrder.id,
       total: total.toFixed(2),
