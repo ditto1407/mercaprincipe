@@ -52,26 +52,36 @@ async function getPayPalToken() {
 }
 
 // ==========================================
-// ENDPOINT 1: CALCULAR PRECIO REAL Y CREAR ORDEN PAYPAL
+// ENDPOINT 1: CALCULAR PRECIO REAL Y CREAR ORDEN PAYPAL (CON LOGS)
 // ==========================================
 app.post('/api/create-order', async (req, res) => {
   try {
     const { items } = req.body;
+    console.log("📦 1. Productos recibidos del frontend:", items);
 
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: 'El carrito está vacío' });
     }
 
-    // 1. Buscar los precios REALES en la base de datos
     const productIds = items.map(item => item.product_id);
+    console.log("🔍 2. Buscando en Supabase los IDs:", productIds);
+
+    // 1. Buscar los precios REALES en la base de datos
     const { data: products, error } = await supabase
       .from('products')
       .select('id, name, price, is_active')
       .in('id', productIds)
       .eq('is_active', true);
 
-    if (error || !products || products.length === 0) {
-      return res.status(400).json({ error: 'Uno o más productos no existen o no están disponibles' });
+    console.log("✅ 3. Respuesta de Supabase:", { encontrados: products?.length, error: error });
+
+    if (error) {
+      console.error("❌ Error de Supabase:", error);
+      return res.status(500).json({ error: 'Error de base de datos al verificar productos' });
+    }
+
+    if (!products || products.length === 0) {
+      return res.status(400).json({ error: 'Ninguno de los productos seleccionados está disponible.' });
     }
 
     // 2. Calcular el subtotal usando los precios del servidor
@@ -79,10 +89,14 @@ app.post('/api/create-order', async (req, res) => {
     const verifiedItems = [];
 
     for (const item of items) {
+      // ⚠️ AQUÍ ESTÁ LA CLAVE: Compara los IDs
       const product = products.find(p => p.id === item.product_id);
+      
       if (!product) {
-        return res.status(400).json({ error: `Producto no encontrado: ${item.product_id}` });
+        console.warn(`⚠️ 4. PRODUCTO RECHAZADO: El ID ${item.product_id} no está activo o no existe en la BD.`);
+        return res.status(400).json({ error: `El producto con ID ${item.product_id} no está disponible o fue desactivado.` });
       }
+      
       if (item.quantity <= 0) {
         return res.status(400).json({ error: 'Cantidad inválida' });
       }
@@ -98,11 +112,13 @@ app.post('/api/create-order', async (req, res) => {
       });
     }
 
-    // 3. CALCULAR ENVÍO DINÁMICO usando la fórmula
+    console.log("💰 5. Subtotal calculado:", subtotal);
+
+    // 3. CALCULAR ENVÍO DINÁMICO
     const shippingCost = calcularCostoEnvio(subtotal);
     const total = subtotal + shippingCost;
 
-    // 4. Crear la orden en PayPal con el monto CORRECTO
+    // 4. Crear la orden en PayPal
     const token = await getPayPalToken();
     const paypalResponse = await fetch(`${PAYPAL_BASE_URL}/v2/checkout/orders`, {
       method: 'POST',
@@ -134,11 +150,13 @@ app.post('/api/create-order', async (req, res) => {
     const paypalOrder = await paypalResponse.json();
 
     if (!paypalOrder.id) {
-      console.error('Error PayPal:', paypalOrder);
+      console.error('❌ Error PayPal:', paypalOrder);
       return res.status(500).json({ error: 'Error al crear orden en PayPal' });
     }
 
-    // 5. Devolver al frontend la orden de PayPal y los datos verificados
+    console.log("🎉 6. Orden de PayPal creada con éxito:", paypalOrder.id);
+
+    // 5. Devolver al frontend
     res.json({
       paypalOrderId: paypalOrder.id,
       total: total.toFixed(2),
@@ -149,7 +167,7 @@ app.post('/api/create-order', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('Error en /api/create-order:', err);
+    console.error('💥 Error catastrófico en /api/create-order:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
