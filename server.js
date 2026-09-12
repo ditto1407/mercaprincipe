@@ -1,6 +1,6 @@
 // ==========================================
 // MercaPrincipe - Backend Seguro
-// Servidor que verifica precios y protege pagos
+// Servidor que verifica precios, protege pagos y cuenta ventas
 // ==========================================
 
 require('dotenv').config();
@@ -29,7 +29,7 @@ const PAYPAL_BASE_URL = process.env.PAYPAL_MODE === 'sandbox'
   ? 'https://api-m.sandbox.paypal.com'
   : 'https://api-m.paypal.com';
 
-// --- FUNCIÓN: Calcular costo de envío basado en el subtotal ---
+// --- FUNCIÓN: Calcular costo de envío ---
 function calcularCostoEnvio(subtotal) {
   const envio = (0.078 * subtotal) + 4.89;
   return Math.round(envio * 100) / 100;
@@ -68,7 +68,6 @@ app.post('/api/create-order', async (req, res) => {
 
     const productIds = items.map(item => item.product_id);
 
-    // 1. Buscar los precios REALES en la base de datos
     const { data: products, error } = await supabase
       .from('products')
       .select('id, name, price, is_active')
@@ -84,8 +83,7 @@ app.post('/api/create-order', async (req, res) => {
       return res.status(400).json({ error: 'Ninguno de los productos seleccionados está disponible.' });
     }
 
-    // 2. Calcular el subtotal y preparar items para PayPal
-    let subtotalEnCentavos = 0; // Usamos centavos para evitar errores de redondeo
+    let subtotalEnCentavos = 0;
     const verifiedItems = [];
     const paypalItems = [];
 
@@ -93,15 +91,12 @@ app.post('/api/create-order', async (req, res) => {
       const product = products.find(p => p.id === item.product_id);
       
       if (!product) {
-        console.warn(`⚠️ PRODUCTO RECHAZADO: El ID ${item.product_id} no está activo o no existe.`);
         return res.status(400).json({ error: `El producto con ID ${item.product_id} no está disponible.` });
       }
-      
       if (item.quantity <= 0) {
         return res.status(400).json({ error: 'Cantidad inválida' });
       }
 
-      // Convertir a centavos para evitar errores de punto flotante
       const priceInCents = Math.round(product.price * 100);
       const itemTotalInCents = priceInCents * item.quantity;
       subtotalEnCentavos += itemTotalInCents;
@@ -114,34 +109,21 @@ app.post('/api/create-order', async (req, res) => {
         subtotal: itemTotalInCents / 100
       });
 
-      // Preparar item para PayPal (máximo 127 caracteres en el nombre)
       paypalItems.push({
         name: product.name.substring(0, 127),
         quantity: item.quantity.toString(),
-        unit_amount: { 
-          currency_code: 'USD', 
-          value: (priceInCents / 100).toFixed(2) 
-        }
+        unit_amount: { currency_code: 'USD', value: (priceInCents / 100).toFixed(2) }
       });
     }
 
-    // Convertir subtotal de centavos a dólares
     const subtotal = subtotalEnCentavos / 100;
-    console.log("💰 Subtotal calculado:", subtotal.toFixed(2), "(desde centavos:", subtotalEnCentavos, ")");
-
-    // 3. CALCULAR ENVÍO DINÁMICO
     const shippingCost = calcularCostoEnvio(subtotal);
     const total = subtotal + shippingCost;
-    console.log("🚚 Envío calculado:", shippingCost.toFixed(2), "| Total:", total.toFixed(2));
 
-    // 4. Crear la orden en PayPal
     const token = await getPayPalToken();
-    
-    // Construir la descripción con los nombres de los productos
     const nombresProductos = verifiedItems.map(p => `${p.quantity}x ${p.product_name}`).join(', ');
     const description = `Pedido MercaPrincipe: ${nombresProductos.substring(0, 1000)}`;
     
-    // Calcular item_total desde los centavos para que coincida EXACTAMENTE
     const itemTotalForPayPal = (subtotalEnCentavos / 100).toFixed(2);
     
     const paypalPayload = {
@@ -151,29 +133,15 @@ app.post('/api/create-order', async (req, res) => {
           currency_code: 'USD',
           value: total.toFixed(2),
           breakdown: {
-            item_total: { 
-              currency_code: 'USD', 
-              value: itemTotalForPayPal
-            },
-            shipping: { 
-              currency_code: 'USD', 
-              value: shippingCost.toFixed(2) 
-            }
+            item_total: { currency_code: 'USD', value: itemTotalForPayPal },
+            shipping: { currency_code: 'USD', value: shippingCost.toFixed(2) }
           }
         },
         description: description,
-        // Solo enviar items si hay 10 o menos (límite de PayPal)
         items: paypalItems.length <= 10 ? paypalItems : undefined
       }]
     };
 
-    console.log("💳 Enviando petición a PayPal con", paypalItems.length, "items");
-    console.log(" Payload breakdown:", {
-      item_total: itemTotalForPayPal,
-      shipping: shippingCost.toFixed(2),
-      total: total.toFixed(2)
-    });
-    
     const paypalResponse = await fetch(`${PAYPAL_BASE_URL}/v2/checkout/orders`, {
       method: 'POST',
       headers: {
@@ -188,32 +156,25 @@ app.post('/api/create-order', async (req, res) => {
     if (!paypalOrder.id) {
       console.error('❌ Error PayPal DETALLADO:', JSON.stringify(paypalOrder, null, 2));
       const errorMsg = paypalOrder.message || paypalOrder.name || 'Error desconocido de PayPal';
-      return res.status(500).json({ 
-        error: `Error al crear orden en PayPal: ${errorMsg}`,
-        details: paypalOrder 
-      });
+      return res.status(500).json({ error: `Error al crear orden en PayPal: ${errorMsg}` });
     }
 
-    console.log("🎉 Orden de PayPal creada con éxito:", paypalOrder.id);
-
-    // 5. Devolver al frontend
     res.json({
       paypalOrderId: paypalOrder.id,
       total: total.toFixed(2),
       subtotal: subtotal.toFixed(2),
       shipping: shippingCost.toFixed(2),
-      items: verifiedItems,
-      approveUrl: paypalOrder.links.find(link => link.rel === 'approve')?.href
+      items: verifiedItems
     });
 
   } catch (err) {
-    console.error('💥 Error catastrófico en /api/create-order:', err);
+    console.error(' Error catastrófico en /api/create-order:', err);
     res.status(500).json({ error: 'Error interno del servidor: ' + err.message });
   }
 });
 
 // ==========================================
-// ENDPOINT 2: CONFIRMAR PAGO Y GUARDAR PEDIDO
+// ENDPOINT 2: CONFIRMAR PAGO, GUARDAR PEDIDO Y ACTUALIZAR VENTAS
 // ==========================================
 app.post('/api/confirm-order', async (req, res) => {
   try {
@@ -223,7 +184,6 @@ app.post('/api/confirm-order', async (req, res) => {
       return res.status(400).json({ error: 'Faltan datos' });
     }
 
-    // 1. Capturar el pago en PayPal
     const token = await getPayPalToken();
     const captureResponse = await fetch(
       `${PAYPAL_BASE_URL}/v2/checkout/orders/${paypalOrderId}/capture`,
@@ -239,16 +199,13 @@ app.post('/api/confirm-order', async (req, res) => {
     const captureData = await captureResponse.json();
 
     if (captureData.status !== 'COMPLETED') {
-      console.error('❌ PayPal no completó el pago:', captureData);
       return res.status(400).json({ error: 'El pago no fue completado por PayPal' });
     }
 
-    // 2. Obtener el monto que PayPal REALMENTE cobró
     const paypalAmount = parseFloat(
       captureData.purchase_units[0].payments.captures[0].amount.value
     );
 
-    // 3. Guardar el pedido en Supabase
     const paypalItems = captureData.purchase_units[0].items || [];
     
     const itemsSummary = paypalItems.length > 0
@@ -291,7 +248,6 @@ app.post('/api/confirm-order', async (req, res) => {
       return res.status(500).json({ error: 'Error al guardar el pedido' });
     }
 
-    // 4. Guardar los items del pedido
     if (paypalItems.length > 0) {
       const itemsParaInsertar = paypalItems.map(item => ({
         order_id: pedido.id,
@@ -300,9 +256,29 @@ app.post('/api/confirm-order', async (req, res) => {
         price: parseFloat(item.unit_amount.value)
       }));
       await supabase.from('order_items').insert(itemsParaInsertar);
+
+      // 🔥 ACTUALIZAR CONTADOR DE VENTAS (sales_count)
+      for (const item of paypalItems) {
+        const quantity = parseInt(item.quantity);
+        
+        const { data: producto } = await supabase
+          .from('products')
+          .select('id, sales_count')
+          .ilike('name', item.name)
+          .single();
+
+        if (producto) {
+          const nuevoContador = (producto.sales_count || 0) + quantity;
+          await supabase
+            .from('products')
+            .update({ sales_count: nuevoContador })
+            .eq('id', producto.id);
+          
+          console.log(`✅ Ventas actualizadas para "${item.name}": ${nuevoContador}`);
+        }
+      }
     }
 
-    // 5. Éxito
     res.json({
       success: true,
       orderId: pedido.id,
@@ -325,25 +301,14 @@ app.get('/api/health', (req, res) => {
 app.post('/api/calculate-shipping', (req, res) => {
   try {
     const { subtotal } = req.body;
-    
-    if (!subtotal || subtotal <= 0) {
-      return res.status(400).json({ error: 'Subtotal inválido' });
-    }
-
+    if (!subtotal || subtotal <= 0) return res.status(400).json({ error: 'Subtotal inválido' });
     const shippingCost = calcularCostoEnvio(subtotal);
-    
-    res.json({
-      subtotal: subtotal.toFixed(2),
-      shipping: shippingCost.toFixed(2),
-      total: (subtotal + shippingCost).toFixed(2)
-    });
+    res.json({ subtotal: subtotal.toFixed(2), shipping: shippingCost.toFixed(2), total: (subtotal + shippingCost).toFixed(2) });
   } catch (err) {
-    console.error('Error en /api/calculate-shipping:', err);
     res.status(500).json({ error: 'Error al calcular envío' });
   }
 });
 
-// --- INICIAR SERVIDOR ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Servidor MercaPrincipe corriendo en puerto ${PORT}`);
