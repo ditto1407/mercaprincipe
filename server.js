@@ -12,7 +12,12 @@ const fetch = require('node-fetch');
 const app = express();
 
 // --- CONFIGURACIÓN ---
-app.use(cors());
+const corsOptions = {
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+};
+app.use(cors(corsOptions));
 app.use(express.json());
 
 const supabase = createClient(
@@ -24,12 +29,13 @@ const PAYPAL_BASE_URL = process.env.PAYPAL_MODE === 'sandbox'
   ? 'https://api-m.sandbox.paypal.com'
   : 'https://api-m.paypal.com';
 
+// PayPal tiene un límite de 10 items por orden
+const PAYPAL_MAX_ITEMS = 10;
+
 // --- FUNCIÓN: Calcular costo de envío basado en el subtotal ---
-// Fórmula: y = 0.078 * x + 4.89
-// Donde x = subtotal de productos, y = costo de envío
 function calcularCostoEnvio(subtotal) {
   const envio = (0.078 * subtotal) + 4.89;
-  return Math.round(envio * 100) / 100; // Redondear a 2 decimales
+  return Math.round(envio * 100) / 100;
 }
 
 // --- FUNCIÓN: Obtener token de PayPal ---
@@ -52,19 +58,18 @@ async function getPayPalToken() {
 }
 
 // ==========================================
-// ENDPOINT 1: CALCULAR PRECIO REAL Y CREAR ORDEN PAYPAL (CON LOGS)
+// ENDPOINT 1: CALCULAR PRECIO REAL Y CREAR ORDEN PAYPAL
 // ==========================================
 app.post('/api/create-order', async (req, res) => {
   try {
     const { items } = req.body;
-    console.log("📦 1. Productos recibidos del frontend:", items);
+    console.log("📦 Productos recibidos del frontend:", items?.length, "productos");
 
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: 'El carrito está vacío' });
     }
 
     const productIds = items.map(item => item.product_id);
-    console.log("🔍 2. Buscando en Supabase los IDs:", productIds);
 
     // 1. Buscar los precios REALES en la base de datos
     const { data: products, error } = await supabase
@@ -72,8 +77,6 @@ app.post('/api/create-order', async (req, res) => {
       .select('id, name, price, is_active')
       .in('id', productIds)
       .eq('is_active', true);
-
-    console.log("✅ 3. Respuesta de Supabase:", { encontrados: products?.length, error: error });
 
     if (error) {
       console.error("❌ Error de Supabase:", error);
@@ -89,12 +92,11 @@ app.post('/api/create-order', async (req, res) => {
     const verifiedItems = [];
 
     for (const item of items) {
-      // ⚠️ AQUÍ ESTÁ LA CLAVE: Compara los IDs
       const product = products.find(p => p.id === item.product_id);
       
       if (!product) {
-        console.warn(`⚠️ 4. PRODUCTO RECHAZADO: El ID ${item.product_id} no está activo o no existe en la BD.`);
-        return res.status(400).json({ error: `El producto con ID ${item.product_id} no está disponible o fue desactivado.` });
+        console.warn(`⚠️ PRODUCTO RECHAZADO: El ID ${item.product_id} no está activo o no existe.`);
+        return res.status(400).json({ error: `El producto con ID ${item.product_id} no está disponible.` });
       }
       
       if (item.quantity <= 0) {
@@ -112,51 +114,95 @@ app.post('/api/create-order', async (req, res) => {
       });
     }
 
-    console.log("💰 5. Subtotal calculado:", subtotal);
+    console.log("💰 Subtotal calculado:", subtotal.toFixed(2));
 
     // 3. CALCULAR ENVÍO DINÁMICO
     const shippingCost = calcularCostoEnvio(subtotal);
     const total = subtotal + shippingCost;
+    console.log("🚚 Envío calculado:", shippingCost.toFixed(2), "| Total:", total.toFixed(2));
 
-    // 4. Crear la orden en PayPal
+    // 4. PREPARAR ITEMS PARA PAYPAL (con límite de 10)
+    let paypalItems;
+    let description = 'Pedido MercaPrincipe - Entrega en Cuba';
+    
+    if (verifiedItems.length <= PAYPAL_MAX_ITEMS) {
+      // Si hay 10 o menos productos, enviar todos normalmente
+      paypalItems = verifiedItems.map(item => ({
+        name: item.product_name.substring(0, 127), // PayPal limita a 127 caracteres
+        quantity: item.quantity.toString(),
+        unit_amount: { currency_code: 'USD', value: item.price.toFixed(2) }
+      }));
+    } else {
+      // Si hay MÁS de 10 productos, agruparlos para que PayPal los acepte
+      console.log(`📦 Agrupando ${verifiedItems.length} productos para PayPal (límite: ${PAYPAL_MAX_ITEMS})`);
+      
+      // Tomamos los primeros 9 productos individualmente
+      paypalItems = verifiedItems.slice(0, PAYPAL_MAX_ITEMS - 1).map(item => ({
+        name: item.product_name.substring(0, 127),
+        quantity: item.quantity.toString(),
+        unit_amount: { currency_code: 'USD', value: item.price.toFixed(2) }
+      }));
+      
+      // Agrupamos el resto en un solo item llamado "Productos adicionales"
+      const productosRestantes = verifiedItems.slice(PAYPAL_MAX_ITEMS - 1);
+      const subtotalRestante = productosRestantes.reduce((sum, p) => sum + p.subtotal, 0);
+      const cantidadRestante = productosRestantes.reduce((sum, p) => sum + p.quantity, 0);
+      const precioPromedio = subtotalRestante / cantidadRestante;
+      
+      paypalItems.push({
+        name: `Otros ${productosRestantes.length} productos`,
+        quantity: cantidadRestante.toString(),
+        unit_amount: { currency_code: 'USD', value: precioPromedio.toFixed(2) }
+      });
+      
+      // Creamos una descripción detallada con todos los productos
+      const nombresProductos = verifiedItems.map(p => `${p.quantity}x ${p.product_name}`).join(', ');
+      description = `Pedido MercaPrincipe: ${nombresProductos.substring(0, 1000)}`;
+    }
+
+    // 5. Crear la orden en PayPal
     const token = await getPayPalToken();
+    const paypalPayload = {
+      intent: 'CAPTURE',
+      purchase_units: [{
+        amount: {
+          currency_code: 'USD',
+          value: total.toFixed(2),
+          breakdown: {
+            item_total: { currency_code: 'USD', value: subtotal.toFixed(2) },
+            shipping: { currency_code: 'USD', value: shippingCost.toFixed(2) }
+          }
+        },
+        description: description
+      }]
+    };
+    
+    // Solo agregar items si hay 10 o menos (para evitar problemas de validación)
+    if (verifiedItems.length <= PAYPAL_MAX_ITEMS) {
+      paypalPayload.purchase_units[0].items = paypalItems;
+    }
+
+    console.log("💳 Enviando petición a PayPal...");
     const paypalResponse = await fetch(`${PAYPAL_BASE_URL}/v2/checkout/orders`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        intent: 'CAPTURE',
-        purchase_units: [{
-          amount: {
-            currency_code: 'USD',
-            value: total.toFixed(2),
-            breakdown: {
-              item_total: { currency_code: 'USD', value: subtotal.toFixed(2) },
-              shipping: { currency_code: 'USD', value: shippingCost.toFixed(2) }
-            }
-          },
-          description: 'Pedido MercaPrincipe - Entrega en Cuba',
-          items: verifiedItems.map(item => ({
-            name: item.product_name,
-            quantity: item.quantity.toString(),
-            unit_amount: { currency_code: 'USD', value: item.price.toFixed(2) }
-          }))
-        }]
-      })
+      body: JSON.stringify(paypalPayload)
     });
 
     const paypalOrder = await paypalResponse.json();
 
     if (!paypalOrder.id) {
-      console.error('❌ Error PayPal:', paypalOrder);
-      return res.status(500).json({ error: 'Error al crear orden en PayPal' });
+      console.error('❌ Error PayPal DETALLADO:', JSON.stringify(paypalOrder, null, 2));
+      const errorMsg = paypalOrder.message || paypalOrder.name || 'Error desconocido de PayPal';
+      return res.status(500).json({ error: `Error al crear orden en PayPal: ${errorMsg}` });
     }
 
-    console.log("🎉 6. Orden de PayPal creada con éxito:", paypalOrder.id);
+    console.log("🎉 Orden de PayPal creada con éxito:", paypalOrder.id);
 
-    // 5. Devolver al frontend
+    // 6. Devolver al frontend
     res.json({
       paypalOrderId: paypalOrder.id,
       total: total.toFixed(2),
@@ -168,7 +214,7 @@ app.post('/api/create-order', async (req, res) => {
 
   } catch (err) {
     console.error('💥 Error catastrófico en /api/create-order:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
+    res.status(500).json({ error: 'Error interno del servidor: ' + err.message });
   }
 });
 
@@ -199,6 +245,7 @@ app.post('/api/confirm-order', async (req, res) => {
     const captureData = await captureResponse.json();
 
     if (captureData.status !== 'COMPLETED') {
+      console.error('❌ PayPal no completó el pago:', captureData);
       return res.status(400).json({ error: 'El pago no fue completado por PayPal' });
     }
 
@@ -280,7 +327,7 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'MercaPrincipe Backend funcionando 🚀' });
 });
 
-// --- ENDPOINT PARA CALCULAR ENVÍO (útil para el frontend) ---
+// --- ENDPOINT PARA CALCULAR ENVÍO ---
 app.post('/api/calculate-shipping', (req, res) => {
   try {
     const { subtotal } = req.body;
